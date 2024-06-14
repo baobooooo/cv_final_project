@@ -4,6 +4,7 @@ import datetime
 import os
 import time
 
+from torch.utils.data import DataLoader, Subset
 import torch
 import torch.utils.data
 from torch import nn
@@ -12,7 +13,7 @@ from engine import train_one_epoch, evaluate
 from dataset.group_by_aspect_ratio import GroupedBatchSampler, create_aspect_ratio_groups
 import argparse
 import torchvision
-
+from faster_rcnn import CustomFasterRCNN
 import cv2
 import random
 
@@ -22,13 +23,13 @@ def get_args():
     parser = argparse.ArgumentParser(description='Pytorch Faster-rcnn Training')
 
     parser.add_argument('--data_path', default='coco', help='dataset path')
-    parser.add_argument('--model', default='fasterrcnn_resnet50_fpn', help='model')
+    parser.add_argument('--model', default='fasterrcnn_resnet34_fpn', help='model')
     parser.add_argument('--dataset', default='coco', help='dataset')
     parser.add_argument('--device', default='cuda', help='device')
-    parser.add_argument('--b', '--batch_size', default=6, type=int)
+    parser.add_argument('--b', '--batch_size', default=4, type=int)
     parser.add_argument('--epochs', default=20, type=int, metavar='N',
                         help='number of total epochs to run')    
-    parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
+    parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 16)')
     parser.add_argument('--lr', default=0.02, type=float, help='initial learning rate')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
@@ -50,7 +51,7 @@ def get_args():
         help="Use pre-trained models from the modelzoo",
         action="store_true",
     )
-    parser.add_argument('--distributed', default=True, help='if distribute or not')
+    parser.add_argument('--distributed', default=False, help='if distribute or not')
     parser.add_argument('--parallel', default=False, help='if distribute or not')
     # distributed training parameters
     parser.add_argument('--world-size', default=1, type=int,
@@ -58,7 +59,7 @@ def get_args():
     parser.add_argument('--dist-url', default='env://', help='url used to set up distributed training')
 
     args = parser.parse_args()
-
+    
     return args
 
 
@@ -89,15 +90,15 @@ def main():
     # Data loading
     print("Loading data")
     dataset, num_classes = get_dataset(args.dataset, "train", get_transform(train=True))
-    dataset_test, _ = get_dataset(args.dataset, "val", get_transform(train=False))    
+    dataset_test, _ = get_dataset(args.dataset, "val", get_transform(train=False))
+    dataset_test = Subset(dataset_test, range(10))
+  
+
 
     print("Creating data loaders")
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+
+    train_sampler = torch.utils.data.RandomSampler(dataset)
+    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
     if args.aspect_ratio_group_factor >= 0:
         group_ids = create_aspect_ratio_groups(dataset, k=args.aspect_ratio_group_factor)
@@ -115,14 +116,21 @@ def main():
         sampler=test_sampler, num_workers=args.workers,
         collate_fn=utils.collate_fn)
 
+
     # Model creating
     print("Creating model")
     # model = models.__dict__[args.model](num_classes=num_classes, pretrained=args.pretrained)   
-    model = torchvision.models.detection.__dict__[args.model](num_classes=num_classes,
-                                                              pretrained=args.pretrained)
+    # model = torchvision.models.detection.__dict__[args.model](num_classes=num_classes,
+    #                                                           pretrained=args.pretrained)
+    model = CustomFasterRCNN(num_classes=91)
 
     device = torch.device(args.device)
     model.to(device)
+    # Load saved model weights
+    print("Loading model weights")
+    model_path = './result/model_0.pth'  # 已保存模型的路径
+    # checkpoint = torch.load(model_path, map_location=device)
+    # model.load_state_dict(checkpoint['model'])
 
     # Distribute
     model_without_ddp = model

@@ -7,6 +7,7 @@ import sys
 sys.path.append('./')
 import coco_names
 import random
+from faster_rcnn import CustomFasterRCNN
 
 def get_args():
     parser = argparse.ArgumentParser(description='Pytorch Faster-rcnn Detection')
@@ -36,7 +37,8 @@ def main():
         
     # Model creating
     print("Creating model")
-    model = torchvision.models.detection.__dict__[args.model](num_classes=num_classes, pretrained=False)  
+    # model = torchvision.models.detection.__dict__[args.model](num_classes=num_classes, pretrained=False)  
+    model = CustomFasterRCNN(num_classes=91)
     model = model.cuda()
 
     model.eval()
