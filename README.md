@@ -12,17 +12,15 @@ https://github.com/pytorch/vision/tree/master/references/detection
 
 ##### data preparation
 The current code only supports training of the coco dataset
-1. Download the coco2017 dataset
+1. Download the coco2014 dataset
 
 2. The data set file structure after downloading is as follows:
 
 ```Shell
   coco/
-    2017/
-      annotations/
-      test2017/
-      train2017/
-      val2017/
+    annotations/
+    train2014/
+    val2014/
 ```
 
 ## Training and testing
