@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.transforms import functional as TF
-
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops import MultiScaleRoIAlign
 
 class BasicBlock(nn.Module):
     def __init__(self, in_planes, planes, stride=1):
@@ -77,160 +79,28 @@ class FeaturePyramidNetwork(nn.Module):
             results.insert(0, self.layer_blocks[idx](last_inner))
         return results
 
-class AnchorGenerator(nn.Module):
-    def __init__(self, sizes=((32,), (64,), (128,), (256,), (512,)), aspect_ratios=((0.5, 1.0, 2.0),) * 5):
-        super(AnchorGenerator, self).__init__()
-        self.sizes = sizes
-        self.aspect_ratios = aspect_ratios
-
-    def forward(self, feature_maps):
-        anchors = []
-        for size, aspect_ratios in zip(self.sizes, self.aspect_ratios):
-            for feature_map in feature_maps:
-                anchors.append(self.generate_anchors(feature_map, size, aspect_ratios))
-        return anchors
-
-    def generate_anchors(self, feature_map, size, aspect_ratios):
-        anchors = []
-        height, width = feature_map.shape[-2:]
-        for y in range(height):
-            for x in range(width):
-                for aspect_ratio in aspect_ratios:
-                    w = size[0] * aspect_ratio ** 0.5
-                    h = size[0] / aspect_ratio ** 0.5
-                    anchors.append([x, y, w, h])
-        return torch.tensor(anchors).float()
-
-class MultiScaleRoIAlign(nn.Module):
-    def __init__(self, featmap_names, output_size, sampling_ratio):
-        super(MultiScaleRoIAlign, self).__init__()
-        self.featmap_names = featmap_names
-        self.output_size = output_size
-        self.sampling_ratio = sampling_ratio
-
-    def forward(self, x, proposals, image_shapes):
-        pooled_features = []
-        for proposal, image_shape in zip(proposals, image_shapes):
-            pooled_feature = self.roi_align(x, proposal, image_shape)
-            pooled_features.append(pooled_feature)
-        return pooled_features
-
-    def roi_align(self, x, proposal, image_shape):
-        return F.adaptive_max_pool2d(x[0], self.output_size)
-
-class RPNHead(nn.Module):
-    def __init__(self, in_channels, num_anchors):
-        super(RPNHead, self).__init__()
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-        self.cls_logits = nn.Conv2d(in_channels, num_anchors, kernel_size=1, stride=1)
-        self.bbox_pred = nn.Conv2d(in_channels, num_anchors * 4, kernel_size=1, stride=1)
+class CustomBackbone(nn.Module):
+    def __init__(self):
+        super(CustomBackbone, self).__init__()
+        self.resnet = ResNet34()
+        self.fpn = FeaturePyramidNetwork([64, 128, 256, 512], 256)
+        self.out_channels = 256  # Adding the required out_channels attribute
 
     def forward(self, x):
-        x = F.relu(self.conv(x))
-        return self.cls_logits(x), self.bbox_pred(x)
-
-class FasterRCNN(nn.Module):
-    def __init__(self, backbone, num_classes, rpn_anchor_generator, box_roi_pool):
-        super(FasterRCNN, self).__init__()
-        self.backbone = backbone
-        self.rpn_anchor_generator = rpn_anchor_generator
-        self.box_roi_pool = box_roi_pool
-
-        self.rpn_head = RPNHead(256, 3)
-        
-        # 添加 box_predictor 分类和回归分支
-        self.box_predictor_cls = nn.Linear(256 * box_roi_pool.output_size * box_roi_pool.output_size, num_classes)
-        self.box_predictor_reg = nn.Linear(256 * box_roi_pool.output_size * box_roi_pool.output_size, 4)
-
-    def forward(self, images, targets=None):
-        if isinstance(images, list):
-            images = torch.stack(images)
-        features = self.backbone(images)
-        feature_maps = features
-        anchors = self.rpn_anchor_generator(feature_maps)
-        rpn_cls_logits, rpn_bbox_pred = self.rpn_head(feature_maps[0])
-        proposals = [rpn_bbox_pred]
-        box_features = self.box_roi_pool(feature_maps, proposals, [img.shape[-2:] for img in images])
-        box_features = torch.cat(box_features, dim=0)
-
-        # 计算分类和回归预测
-        class_logits = self.box_predictor_cls(box_features.view(box_features.size(0), -1))
-        box_regression = self.box_predictor_reg(box_features.view(box_features.size(0), -1))
-
-        if self.training:
-            labels = torch.cat([t["labels"] for t in targets], dim=0)
-            boxes = torch.cat([t["boxes"] for t in targets], dim=0)
-
-            # 匹配分类 logits 和标签
-            loss_classifier = F.cross_entropy(class_logits, labels[:class_logits.size(0)])
-
-            # 计算回归损失
-            loss_box_reg = F.smooth_l1_loss(box_regression, boxes[:box_regression.size(0)])
-
-            loss_objectness = F.binary_cross_entropy_with_logits(rpn_cls_logits, torch.zeros_like(rpn_cls_logits))
-            loss_rpn_box_reg = F.smooth_l1_loss(rpn_bbox_pred, torch.zeros_like(rpn_bbox_pred))
-
-            loss_dict = {
-                "loss_classifier": loss_classifier,
-                "loss_box_reg": loss_box_reg,
-                "loss_objectness": loss_objectness,
-                "loss_rpn_box_reg": loss_rpn_box_reg
-            }
-            return loss_dict
-        else:
-            return class_logits
-
-
-class GeneralizedRCNNTransform(nn.Module):
-    def __init__(self, min_size, max_size, image_mean, image_std):
-        super(GeneralizedRCNNTransform, self).__init__()
-        self.min_size = min_size
-        self.max_size = max_size
-        self.image_mean = image_mean
-        self.image_std = image_std
-
-    def forward(self, images, targets=None):
-        device = images[0].device  # 获取第一个图像的设备
-        images = [self.normalize(image) for image in images]
-        images = [self.resize(image) for image in images]
-        image_sizes = [img.shape[-2:] for img in images]
-        images = self.batch_images(images).to(device)  # 确保批处理后的图像在同一个设备上
-        if targets is not None:
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        return images, targets
-
-    def normalize(self, image):
-        device = image.device  # 获取图像的设备
-        mean = torch.tensor(self.image_mean).to(device).view(-1, 1, 1)
-        std = torch.tensor(self.image_std).to(device).view(-1, 1, 1)
-        return (image - mean) / std
-
-    def resize(self, image):
-        size = self.min_size
-        image = TF.resize(image, size)
-        return image
-
-    def batch_images(self, images, size_divisible=32):
-        max_size = tuple(max(s) for s in zip(*[img.shape for img in images]))
-        stride = size_divisible
-        max_size = list(max_size)
-        max_size[1] = (max_size[1] + stride - 1) // stride * stride
-        max_size[2] = (max_size[2] + stride - 1) // stride * stride
-        batch_shape = [len(images)] + max_size
-        batched_imgs = images[0].new_zeros(batch_shape)
-        for img, pad_img in zip(images, batched_imgs):
-            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
-        return batched_imgs
+        features = self.resnet(x)
+        fpn_output = self.fpn(features)
+        out_dict = {str(i): feature for i, feature in enumerate(fpn_output)}
+        return out_dict
 
 class CustomFasterRCNN(nn.Module):
     def __init__(self, num_classes):
         super(CustomFasterRCNN, self).__init__()
 
-        # 使用 resnet_fpn 作为 backbone
-        backbone = self.resnet_fpn_backbone()
+        # 使用自定义的 backbone
+        backbone = CustomBackbone()
 
         # 定义 RPN 的 anchor generator
-        anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
+        anchor_sizes = ((32,), (64,), (128,), (256,))
         aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
 
         # 创建 anchor generator
@@ -255,28 +125,8 @@ class CustomFasterRCNN(nn.Module):
         )
 
         # 定义 GeneralizedRCNNTransform
-        self.transform = GeneralizedRCNNTransform(min_size=800, max_size=1333, image_mean=[0.485, 0.456, 0.406], image_std=[0.229, 0.224, 0.225])
-
-    def resnet_fpn_backbone(self):
-        resnet = ResNet34()
-        in_channels_list = [64, 128, 256, 512]
-        out_channels = 256
-
-        fpn = FeaturePyramidNetwork(in_channels_list, out_channels)
-        return nn.Sequential(resnet, fpn)
+        # self.transform = CustomGeneralizedRCNNTransform(min_size=800, max_size=1333, image_mean=[0.485, 0.456, 0.406], image_std=[0.229, 0.224, 0.225])
 
     def forward(self, images, targets=None):
-        images, targets = self.transform(images, targets)
+        # images, targets = self.transform(images, targets)
         return self.model(images, targets)
-
-# 使用示例
-num_classes = 91  # 类别数量
-model = CustomFasterRCNN(num_classes)
-
-# 创建虚拟输入
-images = [torch.randn(3, 800, 800), torch.randn(3, 600, 600)]  # Batch size 2
-targets = [{"boxes": torch.tensor([[100, 100, 200, 200]], dtype=torch.float32), "labels": torch.tensor([1])} for _ in range(2)]
-
-# 传递给模型并输出结果
-output = model(images, targets)
-print(output)
